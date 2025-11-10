@@ -1,167 +1,134 @@
-// CIE-297 Backend API (modificado según 16 puntos)
-// Express + CORS + JWT. Reportes manuales (con lat/lng y todos los campos).
-// Mapa: posiciones de agentes (al iniciar sesión/actualizar). Accesos con bloquear/eliminar.
-
+// server.js
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 
 const app = express();
+app.use(cors());
 app.use(express.json());
-app.use(cors({ origin: true, credentials: true }));
 
-const JWT_SECRET = process.env.JWT_SECRET || 'super-secreto-largo-123';
+// --- ENV
 const PORT = process.env.PORT || 3000;
+const JWT_SECRET = process.env.JWT_SECRET || 'super-secreto-largo-123';
 
-// --- Datos en memoria ---
-let USERS = [
-  { email:'admin@cie297.mil', password:'123456', nombre:'Admin', grado:'W1', fuerza:'MA', is_admin:true },
-  { email:'user@cie297.mil',  password:'123456', nombre:'Operador', grado:'W2', fuerza:'MB', is_admin:false }
-];
+// --- Almacenamiento en memoria (demo)
+const users = new Map();       // email -> { email, nombre, password, grado, fuerza, is_admin }
+const accessLog = [];          // {fecha,email,nombre,ip,estado}
+const blocked = new Set();     // emails bloqueados
+const alerts = [];             // reportes enviados manualmente
+const agents = new Map();      // email -> {email, lat, lng, color}
 
-let REPORTS = []; // cada item: ver schema abajo
-let ACCESOS = []; // {fecha, email, nombre, ip, estado}
-let AGENTS  = []; // {email, lat, lng, color, ts}
+// Usuarios semilla (puedes quitarlos si deseas)
+if (!users.has('admin@cie297.mil')) {
+  users.set('admin@cie297.mil', {
+    email: 'admin@cie297.mil', nombre: 'Admin', password: '123456',
+    grado: 'WW', fuerza: 'MA', is_admin: true
+  });
+}
+if (!users.has('user@cie297.mil')) {
+  users.set('user@cie297.mil', {
+    email: 'user@cie297.mil', nombre: 'Operador', password: '123456',
+    grado: 'WW', fuerza: 'MA', is_admin: false
+  });
+}
 
-// --- Helpers / Auth ---
+// --- Helpers
 function sign(user){
-  return jwt.sign({ email:user.email, is_admin: !!user.is_admin, nombre: user.nombre||'' }, JWT_SECRET, { expiresIn:'1d' });
+  const payload = { email: user.email, is_admin: user.is_admin, nombre: user.nombre };
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: '12h' });
 }
 function auth(req,res,next){
-  const h = req.headers['authorization'] || '';
-  const token = h.startsWith('Bearer ') ? h.slice(7) : null;
-  if(!token) return res.status(401).json({ message:'No autorizado' });
-  try{ req.user = jwt.verify(token, JWT_SECRET); next(); }
-  catch(e){ return res.status(401).json({ message:'Token inválido' }); }
+  const h = req.headers.authorization || '';
+  const tok = h.startsWith('Bearer ') ? h.slice(7) : '';
+  try{
+    const data = jwt.verify(tok, JWT_SECRET);
+    req.user = data;
+    next();
+  }catch(e){
+    return res.status(401).json({ message: 'No autorizado' });
+  }
+}
+function clientIp(req){
+  return (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
 }
 
-// --- Rutas básicas ---
-app.get('/api/health', (req,res)=> res.json({ ok:true }));
+// --- Rutas públicas
+app.get('/', (req,res)=>res.json({ ok:true, service:'CIE-297 API' }));
 
-app.post('/api/register', (req,res)=>{
-  const { email, password, nombre, grado, fuerza } = req.body || {};
-  if(!email || !password || !nombre) return res.status(400).json({ message:'Faltan datos' });
-  const exists = USERS.some(u => u.email.toLowerCase()===String(email).toLowerCase());
-  if(exists) return res.status(409).json({ message:'El usuario ya existe' });
-  USERS.push({ email, password, nombre, grado: grado||'W1', fuerza: fuerza||'MA', is_admin:false });
-  return res.status(201).json({ ok:true, message:'Registrado' });
-});
-
-app.post('/api/login', (req,res)=>{
-  const { email, password } = req.body || {};
-  const user = USERS.find(u => u.email.toLowerCase()===String(email||'').toLowerCase() && u.password===password);
-  if(!user) return res.status(401).json({ message:'Credenciales inválidas' });
-
-  const token = sign(user);
-  ACCESOS.push({
-    fecha: Date.now(),
-    email: user.email,
-    nombre: user.nombre || '',
-    ip: req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '-',
-    estado: 'OK'
-  });
-
-  return res.json({ token, user: { email:user.email, nombre:user.nombre, is_admin: !!user.is_admin } });
-});
-
-// --- Posición de agente (para el mapa) ---
-app.post('/api/position', auth, (req,res)=>{
-  const { lat, lng, color } = req.body || {};
-  if(typeof lat!=='number' || typeof lng!=='number'){
-    return res.status(400).json({ message:'Lat/Lng numéricos requeridos' });
+app.post('/login', (req,res)=>{
+  const { email, password } = req.body||{};
+  const u = users.get(String(email||'').toLowerCase());
+  if(!u || u.password !== password){
+    accessLog.push({ fecha: Date.now(), email, nombre: '', ip: clientIp(req), estado:'DENEGADO' });
+    return res.status(401).json({ message:'Credenciales inválidas' });
   }
-  // upsert por email
-  const idx = AGENTS.findIndex(a => a.email===req.user.email);
-  const item = { email:req.user.email, lat, lng, color: (color||'VERDE'), ts: Date.now() };
-  if(idx>=0) AGENTS[idx]=item; else AGENTS.push(item);
+  if(blocked.has(u.email)){
+    accessLog.push({ fecha: Date.now(), email: u.email, nombre: u.nombre, ip: clientIp(req), estado:'BLOQUEADO' });
+    return res.status(403).json({ message:'Usuario bloqueado' });
+  }
+  const token = sign(u);
+  accessLog.push({ fecha: Date.now(), email: u.email, nombre: u.nombre, ip: clientIp(req), estado:'OK' });
+  return res.json({ token, user: { email: u.email, nombre: u.nombre, is_admin: u.is_admin } });
+});
+
+app.post('/register', (req,res)=>{
+  const { nombre, email, password, grado, fuerza } = req.body||{};
+  const key = String(email||'').toLowerCase();
+  if(!nombre || !email || !password) return res.status(400).json({ message:'Datos incompletos' });
+  if(users.has(key)) return res.status(409).json({ message:'Ya existe el usuario' });
+  users.set(key, { email:key, nombre, password, grado, fuerza, is_admin:false });
   return res.json({ ok:true });
 });
 
-app.get('/api/agents', auth, (req,res)=>{
-  // opcional: limpiar agentes viejos (inactivos > 1 día)
-  const cutoff = Date.now() - 24*60*60*1000;
-  AGENTS = AGENTS.filter(a => (a.ts||0) >= cutoff);
-  return res.json({ agents: AGENTS });
+// --- Rutas protegidas
+app.post('/position', auth, (req,res)=>{
+  const { lat, lng, color } = req.body||{};
+  agents.set(req.user.email, { email:req.user.email, lat:Number(lat), lng:Number(lng), color:color||'VERDE' });
+  return res.json({ ok:true });
 });
 
-// --- Reportes manuales ---
-/*
-Schema del reporte (ejemplo):
-{
-  fecha:Number, nivel:String, operacion:String, color:String,
-  pais_ciudad:String, lugar_code:String, personalidad:String,
-  unidad_policial:String, accion_oponente:String, material_equipo:String,
-  transporte:String, otros:String, clasificacion_seg:String, tipo_documento:String,
-  detalle:String, lat:Number, lng:Number,
-  usuario:{ email, nombre }
-}
-*/
-app.post('/api/reports', auth, (req,res)=>{
-  const b = req.body || {};
-  const required = ['nivel','operacion','pais_ciudad','detalle'];
-  for(const k of required){ if(!b[k]) return res.status(400).json({ message:`Falta ${k}` }); }
+app.get('/agents', auth, (req,res)=>{
+  return res.json({ agents: Array.from(agents.values()) });
+});
 
-  const rep = {
+app.post('/reports', auth, (req,res)=>{
+  const body = req.body||{};
+  const rec = {
+    id: alerts.length + 1,
     fecha: Date.now(),
-    nivel: b.nivel,
-    operacion: b.operacion,
-    color: b.color || '',
-    pais_ciudad: b.pais_ciudad || '',
-    lugar_code: b.lugar_code || '',
-    personalidad: b.personalidad || '',
-    unidad_policial: b.unidad_policial || '',
-    accion_oponente: b.accion_oponente || '',
-    material_equipo: b.material_equipo || '',
-    transporte: b.transporte || '',
-    otros: b.otros || '',
-    clasificacion_seg: b.clasificacion_seg || '',
-    tipo_documento: b.tipo_documento || '',
-    detalle: b.detalle || '',
-    lat: typeof b.lat==='number' ? b.lat : null,
-    lng: typeof b.lng==='number' ? b.lng : null,
-    usuario: { email:req.user.email, nombre:req.user.nombre||'' }
+    usuario: { email: req.user.email },
+    ...body
   };
-  REPORTS.unshift(rep);
-  return res.status(201).json({ ok:true, rep });
+  alerts.unshift(rec); // último primero
+  return res.json({ ok:true, id: rec.id });
 });
 
-// --- Vistas de alertas (solo lo manual guardado arriba) ---
-app.get('/api/admin/alerts', auth, (req,res)=>{
-  if(!req.user?.is_admin){
-    // usuarios ven lista simple
-    return res.json({ alertas: REPORTS.slice(0,500) });
-  }
-  // admin ve todo (cap)
-  return res.json({ alertas: REPORTS.slice(0,2000) });
+app.get('/admin/alerts', auth, (req,res)=>{
+  // Devuelve SOLO las enviadas manualmente (no simula)
+  return res.json({ alertas: alerts });
 });
 
-// --- Accesos con bloquear/eliminar ---
-app.get('/api/admin/access', auth, (req,res)=>{
-  if(!req.user?.is_admin) return res.status(403).json({ message:'Solo admin' });
-  return res.json({ accesos: ACCESOS.slice(-2000).reverse() });
+app.get('/admin/access', auth, (req,res)=>{
+  return res.json({ accesos: accessLog });
 });
 
-app.post('/api/admin/access/block', auth, (req,res)=>{
-  if(!req.user?.is_admin) return res.status(403).json({ message:'Solo admin' });
-  const { email } = req.body || {};
-  if(!email) return res.status(400).json({ message:'email requerido' });
-  let updated=0;
-  ACCESOS = ACCESOS.map(a=>{
-    if((a.email||'').toLowerCase()===String(email).toLowerCase()) { updated++; return { ...a, estado:'BLOQUEADO' }; }
-    return a;
-  });
-  return res.json({ ok:true, updated });
+app.post('/admin/access/block', auth, (req,res)=>{
+  const { email } = req.body||{};
+  if(!email) return res.status(400).json({ message:'Email requerido' });
+  blocked.add(String(email).toLowerCase());
+  return res.json({ ok:true });
 });
 
-app.delete('/api/admin/access', auth, (req,res)=>{
-  if(!req.user?.is_admin) return res.status(403).json({ message:'Solo admin' });
-  const { email } = req.body || {};
-  if(!email) return res.status(400).json({ message:'email requerido' });
-  const before = ACCESOS.length;
-  ACCESOS = ACCESOS.filter(a => (a.email||'').toLowerCase() !== String(email).toLowerCase());
-  return res.json({ ok:true, removed: before - ACCESOS.length });
+app.delete('/admin/access', auth, (req,res)=>{
+  const { email } = req.body||{};
+  const target = String(email||'').toLowerCase();
+  const remain = accessLog.filter(a => String(a.email||'').toLowerCase() !== target);
+  accessLog.length = 0; accessLog.push(...remain);
+  return res.json({ ok:true });
 });
 
-// --- Inicio ---
-app.listen(PORT, ()=> console.log(`CIE-297 backend escuchando en :${PORT}`));
+// --- Inicio
+app.listen(PORT, ()=>console.log(`CIE-297 API escuchando en :${PORT}`));
+
 
