@@ -1,134 +1,196 @@
-// server.js
-require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
-const jwt = require('jsonwebtoken');
+// server.js - CIE-297 BACKEND
+require("dotenv").config();
+const express = require("express");
+const cors = require("cors");
+const jwt = require("jsonwebtoken");
 
 const app = express();
-app.use(cors());
+const PORT = process.env.PORT || 3000;
+const JWT_SECRET = process.env.JWT_SECRET || "super-secreto-largo-123";
+
+app.use(
+  cors({
+    origin: true, // permite Vercel y otros orígenes
+    credentials: true,
+  })
+);
 app.use(express.json());
 
-// --- ENV
-const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET || 'super-secreto-largo-123';
+// ====== "Base de datos" simple en memoria ======
+const users = [
+  // usuario admin inicial
+  {
+    email: "admin@cie297.mil",
+    nombre: "Administrador",
+    password: "admin123", // cámbialo en producción
+    grado: "WW",
+    fuerza: "MA",
+    is_admin: true,
+  },
+];
 
-// --- Almacenamiento en memoria (demo)
-const users = new Map();       // email -> { email, nombre, password, grado, fuerza, is_admin }
-const accessLog = [];          // {fecha,email,nombre,ip,estado}
-const blocked = new Set();     // emails bloqueados
-const alerts = [];             // reportes enviados manualmente
-const agents = new Map();      // email -> {email, lat, lng, color}
+let reports = [];  // todas las alertas
+let accesses = []; // todos los accesos
+let agents = [];   // posiciones en el mapa
 
-// Usuarios semilla (puedes quitarlos si deseas)
-if (!users.has('admin@cie297.mil')) {
-  users.set('admin@cie297.mil', {
-    email: 'admin@cie297.mil', nombre: 'Admin', password: '123456',
-    grado: 'WW', fuerza: 'MA', is_admin: true
-  });
-}
-if (!users.has('user@cie297.mil')) {
-  users.set('user@cie297.mil', {
-    email: 'user@cie297.mil', nombre: 'Operador', password: '123456',
-    grado: 'WW', fuerza: 'MA', is_admin: false
-  });
-}
+// ====== Helper de autenticación ======
+function auth(req, res, next) {
+  const header = req.headers.authorization || "";
+  const parts = header.split(" ");
+  const token = parts.length === 2 ? parts[1] : null;
+  if (!token) return res.status(401).json({ message: "Sin token" });
 
-// --- Helpers
-function sign(user){
-  const payload = { email: user.email, is_admin: user.is_admin, nombre: user.nombre };
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: '12h' });
-}
-function auth(req,res,next){
-  const h = req.headers.authorization || '';
-  const tok = h.startsWith('Bearer ') ? h.slice(7) : '';
-  try{
-    const data = jwt.verify(tok, JWT_SECRET);
-    req.user = data;
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.user = payload; // { email, is_admin }
     next();
-  }catch(e){
-    return res.status(401).json({ message: 'No autorizado' });
+  } catch (err) {
+    return res.status(401).json({ message: "Token inválido" });
   }
 }
-function clientIp(req){
-  return (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
-}
 
-// --- Rutas públicas
-app.get('/', (req,res)=>res.json({ ok:true, service:'CIE-297 API' }));
+// ====== RUTAS DE USUARIO ======
 
-app.post('/login', (req,res)=>{
-  const { email, password } = req.body||{};
-  const u = users.get(String(email||'').toLowerCase());
-  if(!u || u.password !== password){
-    accessLog.push({ fecha: Date.now(), email, nombre: '', ip: clientIp(req), estado:'DENEGADO' });
-    return res.status(401).json({ message:'Credenciales inválidas' });
+// Registrar
+app.post("/api/register", (req, res) => {
+  const { nombre, email, password, grado, fuerza } = req.body || {};
+  if (!nombre || !email || !password) {
+    return res.status(400).json({ message: "Faltan datos" });
   }
-  if(blocked.has(u.email)){
-    accessLog.push({ fecha: Date.now(), email: u.email, nombre: u.nombre, ip: clientIp(req), estado:'BLOQUEADO' });
-    return res.status(403).json({ message:'Usuario bloqueado' });
+  if (users.find((u) => u.email === email)) {
+    return res.status(400).json({ message: "Ya existe ese usuario" });
   }
-  const token = sign(u);
-  accessLog.push({ fecha: Date.now(), email: u.email, nombre: u.nombre, ip: clientIp(req), estado:'OK' });
-  return res.json({ token, user: { email: u.email, nombre: u.nombre, is_admin: u.is_admin } });
+  const user = { nombre, email, password, grado, fuerza, is_admin: false };
+  users.push(user);
+  return res.json({ ok: true });
 });
 
-app.post('/register', (req,res)=>{
-  const { nombre, email, password, grado, fuerza } = req.body||{};
-  const key = String(email||'').toLowerCase();
-  if(!nombre || !email || !password) return res.status(400).json({ message:'Datos incompletos' });
-  if(users.has(key)) return res.status(409).json({ message:'Ya existe el usuario' });
-  users.set(key, { email:key, nombre, password, grado, fuerza, is_admin:false });
-  return res.json({ ok:true });
+// Login
+app.post("/api/login", (req, res) => {
+  const { email, password } = req.body || {};
+  const u = users.find((x) => x.email === email && x.password === password);
+  if (!u) return res.status(401).json({ message: "Credenciales inválidas" });
+
+  const token = jwt.sign(
+    { email: u.email, is_admin: u.is_admin },
+    JWT_SECRET,
+    { expiresIn: "12h" }
+  );
+
+  const { password: _pw, ...userPublic } = u;
+  return res.json({ token, user: userPublic });
 });
 
-// --- Rutas protegidas
-app.post('/position', auth, (req,res)=>{
-  const { lat, lng, color } = req.body||{};
-  agents.set(req.user.email, { email:req.user.email, lat:Number(lat), lng:Number(lng), color:color||'VERDE' });
-  return res.json({ ok:true });
-});
+// ====== POSICIONES EN EL MAPA ======
 
-app.get('/agents', auth, (req,res)=>{
-  return res.json({ agents: Array.from(agents.values()) });
-});
+app.post("/api/position", auth, (req, res) => {
+  const { lat, lng, color } = req.body || {};
+  if (typeof lat !== "number" || typeof lng !== "number") {
+    return res.status(400).json({ message: "Lat/Lng inválidos" });
+  }
 
-app.post('/reports', auth, (req,res)=>{
-  const body = req.body||{};
-  const rec = {
-    id: alerts.length + 1,
-    fecha: Date.now(),
-    usuario: { email: req.user.email },
-    ...body
+  const existingIndex = agents.findIndex((a) => a.email === req.user.email);
+  const item = {
+    email: req.user.email,
+    lat,
+    lng,
+    color: (color || "VERDE").toUpperCase(),
+    updated_at: Date.now(),
   };
-  alerts.unshift(rec); // último primero
-  return res.json({ ok:true, id: rec.id });
+
+  if (existingIndex >= 0) agents[existingIndex] = item;
+  else agents.push(item);
+
+  return res.json({ ok: true });
 });
 
-app.get('/admin/alerts', auth, (req,res)=>{
-  // Devuelve SOLO las enviadas manualmente (no simula)
-  return res.json({ alertas: alerts });
+// Lista de agentes para el mapa
+app.get("/api/agents", auth, (req, res) => {
+  res.json({ agents });
 });
 
-app.get('/admin/access', auth, (req,res)=>{
-  return res.json({ accesos: accessLog });
+// ====== ACCESOS ======
+
+app.post("/api/admin/access/log", auth, (req, res) => {
+  const { estado = "OK" } = req.body || {};
+  const item = {
+    email: req.user.email,
+    nombre: req.body.nombre || "",
+    ip: req.ip,
+    estado,
+    fecha: Date.now(),
+  };
+  accesses.push(item);
+  return res.json({ ok: true });
 });
 
-app.post('/admin/access/block', auth, (req,res)=>{
-  const { email } = req.body||{};
-  if(!email) return res.status(400).json({ message:'Email requerido' });
-  blocked.add(String(email).toLowerCase());
-  return res.json({ ok:true });
+// Ver accesos
+app.get("/api/admin/access", auth, (req, res) => {
+  const data = req.user.is_admin
+    ? accesses
+    : accesses.filter((a) => a.email === req.user.email);
+  return res.json({ accesos: data });
 });
 
-app.delete('/admin/access', auth, (req,res)=>{
-  const { email } = req.body||{};
-  const target = String(email||'').toLowerCase();
-  const remain = accessLog.filter(a => String(a.email||'').toLowerCase() !== target);
-  accessLog.length = 0; accessLog.push(...remain);
-  return res.json({ ok:true });
+// Bloquear un email
+app.post("/api/admin/access/block", auth, (req, res) => {
+  if (!req.user.is_admin)
+    return res.status(403).json({ message: "Solo admin" });
+
+  const { email } = req.body || {};
+  accesses = accesses.map((a) =>
+    a.email === email ? { ...a, estado: "BLOQUEADO" } : a
+  );
+  return res.json({ ok: true });
 });
 
-// --- Inicio
-app.listen(PORT, ()=>console.log(`CIE-297 API escuchando en :${PORT}`));
+// Eliminar accesos de un email
+app.delete("/api/admin/access", auth, (req, res) => {
+  if (!req.user.is_admin)
+    return res.status(403).json({ message: "Solo admin" });
+
+  const { email } = req.body || {};
+  accesses = accesses.filter((a) => a.email !== email);
+  return res.json({ ok: true });
+});
+
+// ====== REPORTES / ALERTAS ======
+
+// Crear reporte
+app.post("/api/reports", auth, (req, res) => {
+  const rep = {
+    ...req.body,
+    usuario: { email: req.user.email },
+    fecha: req.body.fecha || Date.now(),
+  };
+  reports.push(rep);
+  return res.json({ ok: true });
+});
+
+// Listar alertas (para admin y usuario)
+app.get("/api/admin/alerts", auth, (req, res) => {
+  let data;
+  if (req.user.is_admin) {
+    data = reports;
+  } else {
+    data = reports.filter(
+      (r) => r.usuario && r.usuario.email === req.user.email
+    );
+  }
+  const ordered = [...data].sort(
+    (a, b) => (b.fecha || 0) - (a.fecha || 0)
+  );
+  return res.json({ alertas: ordered });
+});
+
+// ====== ROOT ======
+app.get("/", (req, res) => {
+  res.send("CIE-297 backend OK");
+});
+
+// ====== START ======
+app.listen(PORT, () => {
+  console.log("CIE-297 backend escuchando en puerto", PORT);
+});
 
 
