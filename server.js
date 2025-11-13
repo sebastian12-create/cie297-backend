@@ -1,142 +1,167 @@
-// server.js - CIE-297 BACKEND
-require("dotenv").config();
+// server.js
 const express = require("express");
 const cors = require("cors");
-const jwt = require("jsonwebtoken");
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET || "super-secreto-largo-123";
-
-app.use(
-  cors({
-    origin: true, // permite Vercel y otros orígenes
-    credentials: true,
-  })
-);
+app.use(cors());
 app.use(express.json());
 
-// ====== "Base de datos" simple en memoria ======
-const users = [
-  // usuario admin inicial
+// ================== MEMORIA DEL SERVIDOR ==================
+let users = [
   {
-    email: "admin@cie297.mil",
+    id: 1,
     nombre: "Administrador",
-    password: "admin123", // cámbialo en producción
+    email: "admin@cie297.mil",
+    password: "admin123",
+    is_admin: true,
     grado: "WW",
     fuerza: "MA",
-    is_admin: true,
   },
 ];
 
-let reports = [];  // todas las alertas
-let accesses = []; // todos los accesos
-let agents = [];   // posiciones en el mapa
+let tokens = {};       // token -> userId
+let alerts = [];       // alertas enviadas
+let accesses = [];     // log de accesos
+let agents = [];       // posiciones en el mapa
 
-// ====== Helper de autenticación ======
+// ================== HEALTH CHECK ==================
+app.get("/api/health", (req, res) => {
+  res.json({ ok: true });
+});
+
+// ================== MIDDLEWARE AUTH ==================
 function auth(req, res, next) {
   const header = req.headers.authorization || "";
   const parts = header.split(" ");
-  const token = parts.length === 2 ? parts[1] : null;
-  if (!token) return res.status(401).json({ message: "Sin token" });
+  const token = parts.length === 2 ? parts[1] : "";
 
-  try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    req.user = payload; // { email, is_admin }
-    next();
-  } catch (err) {
-    return res.status(401).json({ message: "Token inválido" });
+  if (!token || !tokens[token]) {
+    return res.status(401).json({ message: "No autorizado" });
   }
+
+  const user = users.find((u) => u.id === tokens[token]);
+  if (!user) return res.status(401).json({ message: "No autorizado" });
+
+  req.user = user;
+  next();
 }
 
-// ====== RUTAS DE USUARIO ======
+function adminOnly(req, res, next) {
+  if (!req.user || !req.user.is_admin) {
+    return res.status(403).json({ message: "Solo administrador" });
+  }
+  next();
+}
 
-// Registrar
+// ================== AUTH: REGISTER + LOGIN ==================
 app.post("/api/register", (req, res) => {
   const { nombre, email, password, grado, fuerza } = req.body || {};
+
   if (!nombre || !email || !password) {
     return res.status(400).json({ message: "Faltan datos" });
   }
-  if (users.find((u) => u.email === email)) {
-    return res.status(400).json({ message: "Ya existe ese usuario" });
-  }
-  const user = { nombre, email, password, grado, fuerza, is_admin: false };
+
+  const exists = users.some((u) => u.email === email);
+  if (exists) return res.status(400).json({ message: "Email ya registrado" });
+
+  const id = users.length ? users[users.length - 1].id + 1 : 1;
+  const user = {
+    id,
+    nombre,
+    email,
+    password, // sin encriptar para simplificar
+    grado: grado || "",
+    fuerza: fuerza || "",
+    is_admin: false,
+  };
   users.push(user);
+
   return res.json({ ok: true });
 });
 
-// Login
 app.post("/api/login", (req, res) => {
   const { email, password } = req.body || {};
-  const u = users.find((x) => x.email === email && x.password === password);
-  if (!u) return res.status(401).json({ message: "Credenciales inválidas" });
-
-  const token = jwt.sign(
-    { email: u.email, is_admin: u.is_admin },
-    JWT_SECRET,
-    { expiresIn: "12h" }
-  );
-
-  const { password: _pw, ...userPublic } = u;
-  return res.json({ token, user: userPublic });
-});
-
-// ====== POSICIONES EN EL MAPA ======
-
-app.post("/api/position", auth, (req, res) => {
-  const { lat, lng, color } = req.body || {};
-  if (typeof lat !== "number" || typeof lng !== "number") {
-    return res.status(400).json({ message: "Lat/Lng inválidos" });
+  const user = users.find((u) => u.email === email && u.password === password);
+  if (!user) {
+    return res.status(401).json({ message: "Credenciales inválidas" });
   }
 
-  const existingIndex = agents.findIndex((a) => a.email === req.user.email);
-  const item = {
-    email: req.user.email,
-    lat,
-    lng,
-    color: (color || "VERDE").toUpperCase(),
-    updated_at: Date.now(),
+  const token = `${user.id}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  tokens[token] = user.id;
+
+  return res.json({
+    token,
+    user: {
+      email: user.email,
+      nombre: user.nombre,
+      is_admin: user.is_admin || false,
+    },
+  });
+});
+
+// ================== REPORTES ==================
+app.post("/api/reports", auth, (req, res) => {
+  const body = req.body || {};
+  const now = body.fecha || Date.now();
+
+  const report = {
+    ...body,
+    fecha: now,
+    usuarioEmail: req.user.email,
   };
 
-  if (existingIndex >= 0) agents[existingIndex] = item;
-  else agents.push(item);
-
+  alerts.push(report);
   return res.json({ ok: true });
 });
 
-// Lista de agentes para el mapa
-app.get("/api/agents", auth, (req, res) => {
-  res.json({ agents });
+// ------------------ LISTAR ALERTAS (usuario y admin) ------------------
+app.get("/api/admin/alerts", auth, (req, res) => {
+  let result = alerts;
+
+  // si NO es admin, solo sus propias alertas
+  if (!req.user.is_admin) {
+    result = alerts.filter((a) => a.usuarioEmail === req.user.email);
+  }
+
+  // decoramos con objeto usuario (para tabla admin)
+  const decorated = result.map((a) => ({
+    ...a,
+    usuario: { email: a.usuarioEmail || "-" },
+  }));
+
+  return res.json({ alertas: decorated });
 });
 
-// ====== ACCESOS ======
-
+// ================== ACCESOS ==================
 app.post("/api/admin/access/log", auth, (req, res) => {
-  const { estado = "OK" } = req.body || {};
+  const now = req.body?.fecha || Date.now();
+  const ipHeader = req.headers["x-forwarded-for"];
+  const ip =
+    (ipHeader && ipHeader.split(",")[0]) ||
+    req.ip ||
+    "-";
+
   const item = {
     email: req.user.email,
-    nombre: req.body.nombre || "",
-    ip: req.ip,
-    estado,
-    fecha: Date.now(),
+    nombre: req.user.nombre || "",
+    estado: req.body?.estado || "OK",
+    fecha: now,
+    ip,
   };
+
   accesses.push(item);
   return res.json({ ok: true });
 });
 
-// Ver accesos
 app.get("/api/admin/access", auth, (req, res) => {
-  const data = req.user.is_admin
-    ? accesses
-    : accesses.filter((a) => a.email === req.user.email);
-  return res.json({ accesos: data });
+  let result = accesses;
+  if (!req.user.is_admin) {
+    result = accesses.filter((a) => a.email === req.user.email);
+  }
+  return res.json({ accesos: result });
 });
 
-// Bloquear un email
-app.post("/api/admin/access/block", auth, (req, res) => {
-  if (!req.user.is_admin)
-    return res.status(403).json({ message: "Solo admin" });
-
+app.post("/api/admin/access/block", auth, adminOnly, (req, res) => {
   const { email } = req.body || {};
   accesses = accesses.map((a) =>
     a.email === email ? { ...a, estado: "BLOQUEADO" } : a
@@ -144,53 +169,49 @@ app.post("/api/admin/access/block", auth, (req, res) => {
   return res.json({ ok: true });
 });
 
-// Eliminar accesos de un email
-app.delete("/api/admin/access", auth, (req, res) => {
-  if (!req.user.is_admin)
-    return res.status(403).json({ message: "Solo admin" });
-
+app.delete("/api/admin/access", auth, adminOnly, (req, res) => {
   const { email } = req.body || {};
   accesses = accesses.filter((a) => a.email !== email);
   return res.json({ ok: true });
 });
 
-// ====== REPORTES / ALERTAS ======
+// ================== POSICIONES / MAPA ==================
+app.post("/api/position", auth, (req, res) => {
+  const { lat, lng, color } = req.body || {};
+  if (typeof lat !== "number" || typeof lng !== "number") {
+    return res.status(400).json({ message: "Lat/Lng inválidos" });
+  }
 
-// Crear reporte
-app.post("/api/reports", auth, (req, res) => {
-  const rep = {
-    ...req.body,
-    usuario: { email: req.user.email },
-    fecha: req.body.fecha || Date.now(),
+  const existingIndex = agents.findIndex((a) => a.email === req.user.email);
+  const agentData = {
+    email: req.user.email,
+    lat,
+    lng,
+    color: color || "VERDE",
   };
-  reports.push(rep);
+
+  if (existingIndex >= 0) {
+    agents[existingIndex] = agentData;
+  } else {
+    agents.push(agentData);
+  }
+
   return res.json({ ok: true });
 });
 
-// Listar alertas (para admin y usuario)
-app.get("/api/admin/alerts", auth, (req, res) => {
-  let data;
-  if (req.user.is_admin) {
-    data = reports;
-  } else {
-    data = reports.filter(
-      (r) => r.usuario && r.usuario.email === req.user.email
-    );
-  }
-  const ordered = [...data].sort(
-    (a, b) => (b.fecha || 0) - (a.fecha || 0)
-  );
-  return res.json({ alertas: ordered });
+app.get("/api/agents", auth, (req, res) => {
+  return res.json({ agents });
 });
 
-// ====== ROOT ======
+// ================== DEFAULT ROOT ==================
 app.get("/", (req, res) => {
   res.send("CIE-297 backend OK");
 });
 
-// ====== START ======
+// ================== INICIO DEL SERVIDOR ==================
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log("CIE-297 backend escuchando en puerto", PORT);
+  console.log(`CIE-297 backend escuchando en puerto ${PORT}`);
 });
 
 
